@@ -51,8 +51,13 @@
 #include "presets.h"
 #include "opts.h"
 #include "outq.h"
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <errno.h>
 
 using namespace std;
+
+
 
 static EList<string> mates1;  // mated reads (first mate)
 static EList<string> mates2;  // mated reads (second mate)
@@ -255,6 +260,53 @@ static bool sam_format;
 static EList<uint32_t> tab_fmt_cols;
 static EList<string> tab_fmt_cols_str;
 static map<string, uint32_t> col_name_map;
+
+static int MAXFORKS;
+static int DAEMON;
+pthread_mutex_t pidsLock;
+
+char PIPEIN[]="/tmp/centrifuge.in";
+
+void *forkWaiter(void *arg)
+{
+    std::set<int> &pids=*((std::set<int> *)arg);
+    int status;
+
+    while (1)
+    {
+        std::set<int>::iterator it;
+        usleep(1000);
+        std::set<int> deads;
+        for (it=pids.begin(); it!= pids.end(); it++){
+            if (waitpid(*it,&status,WNOHANG))
+                deads.insert(*it);
+        }
+
+        pthread_mutex_lock(&pidsLock);
+        for (it=deads.begin();it!=deads.end(); it++)
+            pids.erase(*it);
+        pthread_mutex_unlock(&pidsLock);
+        
+    }
+}
+
+void timestamp(char *msg)
+{
+	time_t timer;
+	char buffer[100];
+	char buffer2[512];
+	struct tm* tm_info;
+
+	time(&timer);
+	tm_info = localtime(&timer);
+
+	strftime(buffer, 26, "%Y-%m-%d %H:%M:%S", tm_info);
+	sprintf(buffer2,"%s: %s\n",msg,buffer);
+
+	int a=open("/tmp/.centrifuge.log",O_CREAT|O_WRONLY|O_APPEND,0666);
+	write(a,buffer2,strlen(buffer2));
+	close(a);
+}
 
 #ifdef USE_SRA
 static EList<string> sra_accs;
@@ -469,6 +521,8 @@ static void resetOptions() {
 	arbitraryRandom = false; // let pseudo-random seeds be a function of read properties
 	bowtie2p5 = false;
     minHitLen = 22;
+    MAXFORKS=16;
+    DAEMON=0;
     minTotalLen = 0;
     reportFile = "centrifuge_report.tsv";
     abundance_analysis = true;
@@ -607,6 +661,8 @@ static struct option long_options[] = {
 	{(char*)"no-sse8",      no_argument,       0,            ARG_SSE8_NO},
 	{(char*)"scan-narrowed",no_argument,       0,            ARG_SCAN_NARROWED},
 	{(char*)"qc-filter",    no_argument,       0,            ARG_QC_FILTER},
+	{(char*)"forks",    required_argument,       0,            ARG_FORKS},
+	{(char*)"daemon",    no_argument,       0,            ARG_DAEMON},
 	{(char*)"bwa-sw-like",  no_argument,       0,            ARG_BWA_SW_LIKE},
 	{(char*)"multiseed",        required_argument, 0,        ARG_MULTISEED_IVAL},
 	{(char*)"ma",               required_argument, 0,        ARG_SCORE_MA},
@@ -726,6 +782,7 @@ static void printArgDesc(ostream& out) {
 	}
 }
 
+
 /**
  * Print a summary usage message to the provided output stream.
  */
@@ -825,6 +882,8 @@ static void printUsage(ostream& out) {
 	    << " Other:" << endl
 		<< "  --qc-filter        filter out reads that are bad according to QSEQ filter" << endl
 	    << "  --seed <int>       seed for random number generator (0)" << endl
+	    << "  --forks <int>       number of times centrifuge will fork (16)" << endl
+	    << "  --daemon        Daemonize centrifuge" << endl
 	    << "  --non-deterministic seed rand. gen. arbitrarily instead of using read attributes" << endl
 	//  << "  --verbose          verbose output for debugging" << endl
 	    << "  --version          print version information and quit" << endl
@@ -1379,6 +1438,13 @@ static void parseOption(int next_option, const char *arg) {
             minHitLen = parseInt(15, "--min-hitlen arg must be at least 15", arg);
             break;
         }
+        case ARG_FORKS: {
+            MAXFORKS = parseInt(1, "--forks arg must be at least 1", arg);
+            break;
+        }
+        case ARG_DAEMON:
+            DAEMON=1;
+            break;
         case ARG_MIN_TOTALLEN: {
         	minTotalLen = parseInt(50, "--min-totallen arg must be at least 50", arg);
         	break;
@@ -2330,8 +2396,6 @@ static void multiseedSearchWorker(void *vp) {
 	// problems, or generally characterize performance.
 	
 	//const BitPairReference& refs   = *multiseed_refs;
-	auto_ptr<PatternSourcePerThreadFactory> patsrcFact(createPatsrcFactory(patsrc, tid));
-	auto_ptr<PatternSourcePerThread> ps(patsrcFact->create());
 	
 	// Instantiate an object for holding reporting-related parameters.
     ReportingParams rp((allHits ? std::numeric_limits<THitInt>::max() : khits),
@@ -2343,6 +2407,11 @@ static void multiseedSearchWorker(void *vp) {
                                    rp,            // reporting parameters
                                    (size_t)tid);  // thread id
     
+
+	auto_ptr<PatternSourcePerThreadFactory> patsrcFact(createPatsrcFactory(patsrc, tid));
+	auto_ptr<PatternSourcePerThread> ps(patsrcFact->create());
+
+
     Classifier<index_t, local_index_t> classifier(
                                                   ebwtFw,
                                                   multiseed_refnames,
@@ -2353,6 +2422,8 @@ static void multiseedSearchWorker(void *vp) {
                                                   classification_rank,
                                                   host_taxIDs,
                                                   excluded_taxIDs);
+
+
 	OuterLoopMetrics olm;
 	WalkMetrics wlm;
 	ReportingMetrics rpm;
@@ -2737,14 +2808,14 @@ static void multiseedSearch(
 	OutFileBuf *metricsOfb)
 {
 
-    multiseed_patsrc = &patsrc;
+	multiseed_patsrc = &patsrc;
 	multiseed_msink  = &msink;
 	multiseed_ebwtFw = &ebwtFw;
 	multiseed_ebwtBw = &ebwtBw;
 	multiseed_sc     = &sc;
 	multiseed_metricsOfb      = metricsOfb;
 	multiseed_refs = refs;
-    multiseed_refnames = refnames;
+	multiseed_refnames = refnames;
 	AutoArray<tthread::thread*> threads(nthreads);
 	AutoArray<int> tids(nthreads);
 	{
@@ -2752,13 +2823,13 @@ static void multiseedSearch(
 		assert(!ebwtFw.isInMemory());
 		Timer _t(cerr, "Time loading forward index: ", timing);
 		ebwtFw.loadIntoMemory(
-			0,  // colorspace?
-			-1, // not the reverse index
-			true,         // load SA samp? (yes, need forward index's SA samp)
-			true,         // load ftab (in forward index)
-			true,         // load rstarts (in forward index)
-			!noRefNames,  // load names?
-			startVerbose);
+				0,  // colorspace?
+				-1, // not the reverse index
+				true,         // load SA samp? (yes, need forward index's SA samp)
+				true,         // load ftab (in forward index)
+				true,         // load rstarts (in forward index)
+				!noRefNames,  // load names?
+				startVerbose);
 	}
 #if 0
 	if(multiseedMms > 0 || do1mmUpFront) {
@@ -2766,31 +2837,137 @@ static void multiseedSearch(
 		assert(!ebwtBw.isInMemory());
 		Timer _t(cerr, "Time loading mirror index: ", timing);
 		ebwtBw.loadIntoMemory(
-			0, // colorspace?
-			// It's bidirectional search, so we need the reverse to be
-			// constructed as the reverse of the concatenated strings.
-			1,
-			true,        // load SA samp in reverse index
-			true,         // yes, need ftab in reverse index
-			true,        // load rstarts in reverse index
-			!noRefNames,  // load names?
-			startVerbose);
+				0, // colorspace?
+				// It's bidirectional search, so we need the reverse to be
+				// constructed as the reverse of the concatenated strings.
+				1,
+				true,        // load SA samp in reverse index
+				true,         // yes, need ftab in reverse index
+				true,        // load rstarts in reverse index
+				!noRefNames,  // load names?
+				startVerbose);
 	}
 #endif
+
+    if (DAEMON)
+    {
+
+        char _buff[512];
+        sprintf(_buff,"IDX_LOADED[%s]",bt2index.c_str());
+        timestamp(_buff);
+        char randomval[9];
+        int reader;
+
+        std::set<int> pids;
+        pthread_t fWaiter;
+        pthread_mutex_init(&pidsLock, NULL);
+        pthread_create(&fWaiter, 0, forkWaiter, &pids);
+
+        randomval[8]='\0';
+
+        mkfifo(PIPEIN,0666);
+        chmod(PIPEIN,0666);
+
+        int f=open("/tmp/.centrifuge.pid",O_CREAT | O_WRONLY,0666);
+        ftruncate(f,0);
+        char spid[10];
+        sprintf(spid,"%d",getpid());
+        write(f,spid,strlen(spid));
+        close(f);
+        unlink("/var/lock/metrichor-worker");
+
+        reader=open(PIPEIN,O_RDONLY);
+        int kk=0;
+
+        while (1)
+        {
+            if (pids.size()>=MAXFORKS)
+            {
+                usleep(1000);
+                continue;
+            }
+
+            int sz=read(reader,randomval,8);
+
+            if (!sz)
+            {
+                usleep(1000);
+                continue;
+            }
+
+
+            kk++;
+
+
+            int pid=fork();
+            if (!pid)
+            {
+                close(reader);
+                char inp_f[100];
+                char out_f[100];
+                char buff[100];
+                sprintf(inp_f,"/tmp/.cfg.inp.%s",randomval);
+                sprintf(out_f,"/tmp/.cfg.out.%s",randomval);
+
+                freopen(inp_f,"r",stdin);
+                //			freopen(out_f,"w",stdout);
+                int fd=open(out_f,O_WRONLY);
+                dup2(fd, 1);
+                dup2(fd, 2);
+                //              dup2(open("/dev/null",0), 2);
+                fgets(buff,100,stdin);
+                sscanf(buff,"%d,%d",&minHitLen,&minTotalLen);
+                break;
+            }
+            else {
+                if (pid==-1)
+                {
+                    int fd;
+                    char inp_f[100];
+                    char out_f[100];
+                    char buff[100];
+                    char eagain[]="Error: EAGAIN";
+                    char enomem[]="Error: ENOMEM";
+                    char enosys[]="Error: ENOSYS";
+                    sprintf(inp_f,"/tmp/.cfg.inp.%s",randomval);
+                    sprintf(out_f,"/tmp/.cfg.out.%s",randomval);
+                    fd=open(inp_f,O_RDONLY);
+                    while (read(fd,buff,99)){}
+                    close(fd);
+
+                    fd=open(out_f,O_WRONLY);
+                    if (errno==EAGAIN)
+                        write(fd,eagain,strlen(eagain));
+                    if (errno==ENOMEM)
+                        write(fd,enomem,strlen(enomem));
+                    if (errno==ENOSYS)
+                        write(fd,enosys,strlen(enosys));
+                    close(fd);
+
+                }
+                else
+                {
+                    pthread_mutex_lock(&pidsLock);
+                    pids.insert(pid);
+                    pthread_mutex_unlock(&pidsLock);
+                }
+            }
+        }
+    }
 	// Start the metrics thread
 	{
 		Timer _t(cerr, "Multiseed full-index search: ", timing);
-        
-        thread_rids.resize(nthreads);
-        thread_rids.fill(0);
+
+		thread_rids.resize(nthreads);
+		thread_rids.fill(0);
 		for(int i = 0; i < nthreads; i++) {
 			// Thread IDs start at 1
 			tids[i] = i+1;
-            threads[i] = new tthread::thread(multiseedSearchWorker, (void*)&tids[i]);
+			threads[i] = new tthread::thread(multiseedSearchWorker, (void*)&tids[i]);
 		}
 
-        for (int i = 0; i < nthreads; i++)
-            threads[i]->join();
+		for (int i = 0; i < nthreads; i++)
+			threads[i]->join();
 
 	}
 	if(!metricsPerRead && (metricsOfb != NULL || metricsStderr)) {
@@ -3018,6 +3195,8 @@ static void driver(
 		// Do the search for all input reads
 		assert(patsrc != NULL);
 		assert(mssink != NULL);
+		
+
 		multiseedSearch(
 			sc,      // scoring scheme
 			*patsrc, // pattern source
@@ -3156,6 +3335,7 @@ extern "C" {
  * function.
  */
 int centrifuge(int argc, const char **argv) {
+
 	try {
 		// Reset all global state, including getopt state
 		opterr = optind = 1;
@@ -3279,6 +3459,12 @@ int centrifuge(int argc, const char **argv) {
 				cout << "Press key to continue..." << endl;
 				getchar();
 			}
+
+			int f=open("/tmp/.centrifuge.pid",O_CREAT | O_WRONLY,0666);
+			ftruncate(f,0);
+			write(f,"-",1);
+			close(f);
+			timestamp("\n=====================\nSTARTED");
 			driver<SString<char> >("DNA", bt2index, outfile);
 		}
 		return 0;
