@@ -1,0 +1,175 @@
+diff --git a/Makefile b/Makefile
+index c4627c9..bb3c612 100644
+--- a/Makefile
++++ b/Makefile
+@@ -57,7 +57,6 @@ endif
+ 
+ POPCNT_CAPABILITY ?= 1
+ ifeq (1, $(POPCNT_CAPABILITY))
+-    EXTRA_FLAGS += -DPOPCNT_CAPABILITY
+     INC += -I third_party
+ endif
+ 
+@@ -154,13 +153,12 @@ endif
+ BITS_FLAG =
+ 
+ ifeq (32,$(BITS))
+-	BITS_FLAG = -m32
+ endif
+ 
+ ifeq (64,$(BITS))
+ 	BITS_FLAG = -m64
+ endif
+-SSE_FLAG=-msse2
++SSE_FLAG=-O2 -ftree-vectorize
+ 
+ DEBUG_FLAGS    = -O0 -g3 $(BIToS_FLAG) $(SSE_FLAG)
+ DEBUG_DEFS     = -DCOMPILER_OPTIONS="\"$(DEBUG_FLAGS) $(EXTRA_FLAGS)\""
+diff --git a/aligner_sw.h b/aligner_sw.h
+index 699b098..eaa3882 100644
+--- a/aligner_sw.h
++++ b/aligner_sw.h
+@@ -70,7 +70,7 @@
+ #include <iostream>
+ #include <limits>
+ #include "threading.h"
+-#include <emmintrin.h>
++#include "neon-emmintrin.h"
+ #include "aligner_sw_common.h"
+ #include "aligner_sw_nuc.h"
+ #include "ds.h"
+diff --git a/sse_util.h b/sse_util.h
+index b5781f1..87fe772 100644
+--- a/sse_util.h
++++ b/sse_util.h
+@@ -24,7 +24,7 @@
+ #include "ds.h"
+ #include "limit.h"
+ #include <iostream>
+-#include <emmintrin.h>
++#include "neon-emmintrin.h"
+ 
+ class EList_m128i {
+ public:
+diff --git a/third_party/cpuid.h b/third_party/cpuid.h
+index 6a9688f..0d5ca2c 100644
+--- a/third_party/cpuid.h
++++ b/third_party/cpuid.h
+@@ -120,51 +120,52 @@
+ static __inline unsigned int
+ __get_cpuid_max (unsigned int __ext, unsigned int *__sig)
+ {
+-  unsigned int __eax, __ebx, __ecx, __edx;
+-
+-#ifndef __x86_64__
+-#if __GNUC__ >= 3
+-  /* See if we can use cpuid.  On AMD64 we always can.  */
+-  __asm__ ("pushf{l|d}\n\t"
+-	   "pushf{l|d}\n\t"
+-	   "pop{l}\t%0\n\t"
+-	   "mov{l}\t{%0, %1|%1, %0}\n\t"
+-	   "xor{l}\t{%2, %0|%0, %2}\n\t"
+-	   "push{l}\t%0\n\t"
+-	   "popf{l|d}\n\t"
+-	   "pushf{l|d}\n\t"
+-	   "pop{l}\t%0\n\t"
+-	   "popf{l|d}\n\t"
+-	   : "=&r" (__eax), "=&r" (__ebx)
+-	   : "i" (0x00200000));
+-#else
+-/* Host GCCs older than 3.0 weren't supporting Intel asm syntax
+-   nor alternatives in i386 code.  */
+-  __asm__ ("pushfl\n\t"
+-	   "pushfl\n\t"
+-	   "popl\t%0\n\t"
+-	   "movl\t%0, %1\n\t"
+-	   "xorl\t%2, %0\n\t"
+-	   "pushl\t%0\n\t"
+-	   "popfl\n\t"
+-	   "pushfl\n\t"
+-	   "popl\t%0\n\t"
+-	   "popfl\n\t"
+-	   : "=&r" (__eax), "=&r" (__ebx)
+-	   : "i" (0x00200000));
+-#endif
+-
+-  if (!((__eax ^ __ebx) & 0x00200000))
+-    return 0;
+-#endif
+-
+-  /* Host supports cpuid.  Return highest supported cpuid input value.  */
+-  __cpuid (__ext, __eax, __ebx, __ecx, __edx);
+-
+-  if (__sig)
+-    *__sig = __ebx;
+-
+-  return __eax;
++  return 0;
++//  unsigned int __eax, __ebx, __ecx, __edx;
++//
++//#ifndef __x86_64__
++//#if __GNUC__ >= 3
++//  /* See if we can use cpuid.  On AMD64 we always can.  */
++//  __asm__ ("pushf{l|d}\n\t"
++//	   "pushf{l|d}\n\t"
++//	   "pop{l}\t%0\n\t"
++//	   "mov{l}\t{%0, %1|%1, %0}\n\t"
++//	   "xor{l}\t{%2, %0|%0, %2}\n\t"
++//	   "push{l}\t%0\n\t"
++//	   "popf{l|d}\n\t"
++//	   "pushf{l|d}\n\t"
++//	   "pop{l}\t%0\n\t"
++//	   "popf{l|d}\n\t"
++//	   : "=&r" (__eax), "=&r" (__ebx)
++//	   : "i" (0x00200000));
++//#else
++///* Host GCCs older than 3.0 weren't supporting Intel asm syntax
++//   nor alternatives in i386 code.  */
++//  __asm__ ("pushfl\n\t"
++//	   "pushfl\n\t"
++//	   "popl\t%0\n\t"
++//	   "movl\t%0, %1\n\t"
++//	   "xorl\t%2, %0\n\t"
++//	   "pushl\t%0\n\t"
++//	   "popfl\n\t"
++//	   "pushfl\n\t"
++//	   "popl\t%0\n\t"
++//	   "popfl\n\t"
++//	   : "=&r" (__eax), "=&r" (__ebx)
++//	   : "i" (0x00200000));
++//#endif
++//
++//  if (!((__eax ^ __ebx) & 0x00200000))
++//    return 0;
++//#endif
++//
++//  /* Host supports cpuid.  Return highest supported cpuid input value.  */
++//  __cpuid (__ext, __eax, __ebx, __ecx, __edx);
++//
++//  if (__sig)
++//    *__sig = __ebx;
++//
++//  return __eax;
+ }
+ 
+ /* Return cpuid data for requested cpuid level, as found in returned
+@@ -177,11 +178,12 @@ __get_cpuid (unsigned int __level,
+ 	     unsigned int *__eax, unsigned int *__ebx,
+ 	     unsigned int *__ecx, unsigned int *__edx)
+ {
+-  unsigned int __ext = __level & 0x80000000;
+-
+-  if (__get_cpuid_max (__ext, 0) < __level)
+-    return 0;
+-
+-  __cpuid (__level, *__eax, *__ebx, *__ecx, *__edx);
+-  return 1;
++  return 0;
++//  unsigned int __ext = __level & 0x80000000;
++//
++//  if (__get_cpuid_max (__ext, 0) < __level)
++//    return 0;
++//
++//  __cpuid (__level, *__eax, *__ebx, *__ecx, *__edx);
++//  return 1;
+ }
